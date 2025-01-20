@@ -4,20 +4,70 @@ using System.Collections.Generic;
 using System.Linq;
 
 public class PlayerMover : MonoBehaviour {
-    public Transform[] pathPoints; // 이동 경로 포인트들
+    public Transform[] pathPoints;
+    public int teamID;
     private int currentPointIndex = 0;
-    private int score = 0; // 점수 관리
-    private bool isMoving = false; // 이동 중 여부
-    private Vector3 originalPosition; // 이동 전 가장 처음 위치
+    private int score = 0;
+    private bool isMoving = false;
+    private Vector3 originalPosition;
 
-    private List<GameObject> teamPieces = new List<GameObject>(); // 같은 팀 말 관리
+    private List<GameObject> teamPieces = new List<GameObject>();
+    private List<PlayerMover> stackedPieces = new List<PlayerMover>();
+
+    private TurnManager turnManager;
+
+    public Material outlineMaterial;
+
+    private Renderer[] renderers;
+    private Material[][] originalMaterials;
+
+    private void Awake() {
+        InitializeRenderers();
+        InitializeOutlineMaterial();
+        turnManager = FindFirstObjectByType<TurnManager>();
+    }
+
+    private void InitializeRenderers() {
+        try {
+            Renderer ownRenderer = GetComponent<Renderer>();
+            renderers = ownRenderer != null ? new Renderer[] { ownRenderer } : GetComponentsInChildren<Renderer>();
+
+            if (renderers == null || renderers.Length == 0) {
+                Debug.LogError($"[{gameObject.name}] Renderer를 찾을 수 없습니다!");
+                return;
+            }
+
+            originalMaterials = new Material[renderers.Length][];
+            for (int i = 0; i < renderers.Length; i++) {
+                if (renderers[i] != null && renderers[i].materials != null) {
+                    originalMaterials[i] = renderers[i].materials;
+                } else {
+                    Debug.LogError($"[{gameObject.name}] {i}번째 Renderer 또는 Material이 null입니다!");
+                }
+            }
+            Debug.Log($"[{gameObject.name}] Renderer 초기화 완료: {renderers.Length}개");
+        } catch (System.Exception e) {
+            Debug.LogError($"[{gameObject.name}] Renderer 초기화 중 오류 발생: {e.Message}");
+        }
+    }
+
+    private void InitializeOutlineMaterial() {
+        if (outlineMaterial == null) {
+            outlineMaterial = Resources.Load<Material>("OutlineMaterial");
+            if (outlineMaterial == null) {
+                Debug.LogError($"[{gameObject.name}] OutlineMaterial을 Resources 폴더에서 찾을 수 없습니다!");
+            }
+        }
+    }
 
     void Start() {
         if (pathPoints == null || pathPoints.Length == 0) Debug.LogError("PathPoints 배열이 설정되지 않았습니다!");
+        if (renderers == null || renderers.Length == 0) InitializeRenderers();
     }
 
     public void MovePlayer(string yutResult) {
         if (isMoving) return;
+        DisableOutline();
         int moveSteps = GetMoveSteps(yutResult);
         StartCoroutine(MoveSteps(moveSteps));
     }
@@ -28,13 +78,26 @@ public class PlayerMover : MonoBehaviour {
         int remainingSteps = Mathf.Abs(steps);
         int direction = steps >= 0 ? 1 : -1;
 
+        // 윷과 bowl 비활성화
+        if (turnManager != null && turnManager.yutThrower != null) {
+            turnManager.yutThrower.DisableYuts();
+        }
+
         while (remainingSteps > 0) {
             int nextIndex = GetNextIndex(currentPointIndex, direction);
-            if (nextIndex < 0 || nextIndex >= pathPoints.Length) break; // 시작 지점 이전이나 경로를 벗어나는 이동 금지
+            if (nextIndex < 0 || nextIndex >= pathPoints.Length) break;
             yield return StartCoroutine(MoveToPosition(nextIndex));
             remainingSteps--;
         }
         isMoving = false;
+
+        HandleCollision();
+        if (turnManager != null) {
+            turnManager.NextPlayer();
+            if (turnManager.throwButton != null) {
+                turnManager.throwButton.gameObject.SetActive(true); // 이동이 끝나면 throwButton 활성화
+            }
+        }
     }
 
     private int GetNextIndex(int currentIndex, int direction) {
@@ -43,7 +106,7 @@ public class PlayerMover : MonoBehaviour {
 
     private int GetBackwardIndex(int currentIndex) {
         switch (currentIndex) {
-            case 0: return 19;
+            case 0: return 0;
             case 15: return 28;
             case 28: return 27;
             case 27: return 20;
@@ -88,11 +151,11 @@ public class PlayerMover : MonoBehaviour {
 
         Vector3 startPos = transform.position;
         Vector3 endPos = pathPoints[targetIndex].position;
-        endPos.y = 2; // y 포지션을 기본값 2로 설정
+        endPos.y = 2;
         float duration = 0.5f;
         float elapsed = 0f;
 
-        Vector3 centerPos = (startPos + endPos) * 0.5f + Vector3.up * 2f; // 점프 효과
+        Vector3 centerPos = (startPos + endPos) * 0.5f + Vector3.up * 2f;
 
         while (elapsed < duration) {
             float t = elapsed / duration;
@@ -105,27 +168,49 @@ public class PlayerMover : MonoBehaviour {
         transform.position = endPos;
         currentPointIndex = targetIndex;
 
-        HandleCollision(); // 같은 칸에 다른 팀 말이 있으면 처리
+        yield return new WaitForSeconds(0.1f);
     }
 
-    private void HandleCollision() { // 충돌 처리: 같은 칸에 상대 말이 있으면 잡기
-        var piecesOnSameTile = FindObjectsByType<PlayerMover>(FindObjectsSortMode.None).Where(p => p.currentPointIndex == currentPointIndex && p != this);
+    private void HandleCollision() {
+        var piecesOnSameTile = FindObjectsByType<PlayerMover>(FindObjectsSortMode.None)
+            .Where(p => p.currentPointIndex == currentPointIndex && p != this);
 
         foreach (var piece in piecesOnSameTile) {
-            if (!teamPieces.Contains(piece.gameObject)) {// 상대 팀 말 잡기
+            if (!IsSameTeam(piece)) {
                 Debug.Log($"상대 팀 말 잡음! 위치: {currentPointIndex}");
-                piece.ResetToStart();
+                piece.gameObject.SetActive(false);
                 score += 1;
-            } 
-            else Debug.Log($"팀 말 합체: {currentPointIndex}");
+            } else {
+                StackPiece(piece);
+                Debug.Log($"팀 말 합체: {currentPointIndex}");
+            }
         }
     }
 
-    private void ResetToStart() {
+    private bool IsSameTeam(PlayerMover other) {
+        return this.teamID == other.teamID;
+    }
+
+    private void StackPiece(PlayerMover piece) {
+        if (!stackedPieces.Contains(piece)) {
+            stackedPieces.Add(piece);
+            piece.transform.SetParent(this.transform);
+            piece.transform.localScale *= 1.1f;
+        }
+    }
+
+    public void ResetToStart() {
         currentPointIndex = 0;
         Vector3 startPosition = pathPoints[0].position;
-        startPosition.y = 2; // y 포지션을 기본값 2로 설정
+        startPosition.y = 2;
         transform.position = startPosition;
+
+        foreach (var piece in stackedPieces) {
+            piece.transform.SetParent(null);
+            piece.transform.localScale /= 1.1f;
+            piece.gameObject.SetActive(false);
+        }
+        stackedPieces.Clear();
     }
 
     public int GetMoveSteps(string yutResult) {
@@ -138,5 +223,47 @@ public class PlayerMover : MonoBehaviour {
             case "모": return 5;
             default: return 0;
         }
+    }
+
+    void OnMouseDown() {
+        TurnManager turnManager = FindFirstObjectByType<TurnManager>();
+        if (turnManager != null) turnManager.OnExistingPieceClicked(this);
+        else Debug.LogError("TurnManager를 찾을 수 없습니다!");
+    }
+
+    public void EnableOutline() {
+        if (outlineMaterial == null) {
+            Debug.LogError($"[{gameObject.name}] OutlineMaterial이 할당되지 않았습니다!");
+            return;
+        }
+        if (renderers == null || renderers.Length == 0) {
+            Debug.LogError($"[{gameObject.name}] Renderers가 초기화되지 않았습니다!");
+            InitializeRenderers();
+            if (renderers == null || renderers.Length == 0) return;
+        }
+        foreach (Renderer renderer in renderers) {
+            if (renderer != null) {
+                List<Material> mats = renderer.materials.ToList();
+                if (!mats.Contains(outlineMaterial)) {
+                    mats.Add(outlineMaterial);
+                    renderer.materials = mats.ToArray();
+                }
+            }
+        }
+        Debug.Log($"[{gameObject.name}] Outline enabled");
+    }
+
+    public void DisableOutline() {
+        if (renderers == null || originalMaterials == null) {
+            Debug.LogError($"[{gameObject.name}] Renderer 또는 OriginalMaterials가 초기화되지 않았습니다!");
+            InitializeRenderers();
+            if (renderers == null || originalMaterials == null) return;
+        }
+        for (int i = 0; i < renderers.Length; i++) {
+            if (renderers[i] != null && originalMaterials[i] != null) {
+                renderers[i].materials = originalMaterials[i];
+            }
+        }
+        Debug.Log($"[{gameObject.name}] Outline disabled");
     }
 }
